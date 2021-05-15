@@ -1,160 +1,289 @@
 #include <jni.h>
 #include <string>
 #include "Log.h"
-#include <GLES/gl.h>
-#include <GLES/glext.h>
-//#include <GLES2/gl2.h>
-//#include <EGL/egl.h>
-//#include <android/native_window_jni.h>
+extern "C"
+JNIEXPORT jstring
 
+JNICALL
+Java_com_example_ffmpeg_1yuv_MainActivity_stringFromJNI(
+        JNIEnv *env,
+        jobject /* this */) {
+    std::string hello = "Hello from C++";
+    return env->NewStringUTF(hello.c_str());
+}
+
+#include "ShaderUtils.h"
+#include <EGL/egl.h>
+#include <android/native_window_jni.h>
+#include <unistd.h>
 
 extern "C"{
-    #include <libavcodec/avcodec.h>
-    //封装格式处理
-    #include <libavformat/avformat.h>
-    //像素处理
-    #include <libswscale/swscale.h>
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/imgutils.h>
+#include <libavfilter/avfilter.h>
 }
 
-int _IS_REGISTER_ALL = 0;
-bool is_inited = false;
-AVCodec *h264_codec = NULL;
-AVCodecContext *h264_codec_ctx = NULL;
-int width = 0;
-int height = 0;
+#define GET_STR(x) #x
+const char *vertexShaderString = GET_STR(
+        attribute vec4 aPosition;
+        attribute vec2 aTexCoord;
+        varying vec2 vTexCoord;
+        void main() {
+            vTexCoord=vec2(aTexCoord.x,1.0-aTexCoord.y);
+            gl_Position = aPosition;
+        }
+);
+const char *fragmentShaderString = GET_STR(
+        precision mediump float;
+        varying vec2 vTexCoord;
+        uniform sampler2D yTexture;
+        uniform sampler2D uTexture;
+        uniform sampler2D vTexture;
+        void main() {
+            vec3 yuv;
+            vec3 rgb;
+            yuv.r = texture2D(yTexture, vTexCoord).r;
+            yuv.g = texture2D(uTexture, vTexCoord).r - 0.5;
+            yuv.b = texture2D(vTexture, vTexCoord).r - 0.5;
+            rgb = mat3(1.0,       1.0,         1.0,
+                       0.0,       -0.39465,  2.03211,
+                       1.13983, -0.58060,  0.0) * yuv;
+            gl_FragColor = vec4(rgb, 1.0);
+        }
+);
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_com_decoder_ling_H264Decoder_nativeInit(JNIEnv *env, jclass clazz) {
-    // TODO: implement nativeInit()
-    LOGE("进来了...");
-    AVFormatContext *avFormatContext = avformat_alloc_context();
-    LOGE("出去了...");
-}
+Java_com_example_ffmpeg_1yuv_MainActivity_videoPlay(JNIEnv *env, jobject instance, jstring path_,
+                                                    jobject surface) {
+    const char *path = env->GetStringUTFChars(path_, 0);
 
-extern "C"
-JNIEXPORT jint JNICALL
-Java_com_decoder_ling_H264Decoder_init(JNIEnv *env, jclass thiz) {
-    // TODO: implement init()
-    LOGE("进来了...Java_com_decoder_ling_H264Decoder_init");
-    AVFormatContext *avFormatContext = avformat_alloc_context();
-    if (is_inited) return 1;
-
-    if (!_IS_REGISTER_ALL) {
-        av_register_all();
-        _IS_REGISTER_ALL = 1;
+    // TODO
+/***
+     * ffmpeg 初始化
+     * **/
+    av_register_all();
+    AVFormatContext *fmt_ctx = avformat_alloc_context();
+    if (avformat_open_input(&fmt_ctx, path, NULL, NULL) < 0) {
+        return;
     }
-
-    h264_codec = avcodec_find_decoder(AV_CODEC_ID_H264);
-    if (!h264_codec) {
-        return -1;
+    if (avformat_find_stream_info(fmt_ctx, NULL) < 0) {
+        return;
     }
-    h264_codec_ctx = avcodec_alloc_context3(h264_codec);
-    if (!h264_codec_ctx) {
-        return -2;
+    AVStream *avStream = NULL;
+    int video_stream_index = -1;
+    for (int i = 0; i < fmt_ctx->nb_streams; i++) {
+        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            avStream =fmt_ctx->streams[i];
+            video_stream_index = i;
+            break;
+        }
     }
-
-    h264_codec_ctx->time_base.num = 1;
-    h264_codec_ctx->frame_number = 1;
-    h264_codec_ctx->codec_type = AVMEDIA_TYPE_VIDEO;
-    h264_codec_ctx->bit_rate = 0;
-     h264_codec_ctx->pix_fmt = AV_PIX_FMT_YUVJ420P;
-    // h264_codec_ctx->time_base.den = den; //帧率
-//    h264_codec_ctx->pix_fmt = AV_PIX_FMT_YUVJ420P;
-//    h264_codec_ctx->color_range = AVCOL_RANGE_MPEG;
-    LOGE("进来了2222...Java_com_decoder_ling_H264Decoder_init i = %d",h264_codec_ctx->pix_fmt);
-    if (avcodec_open2(h264_codec_ctx, h264_codec, 0) == 0) {
-        LOGE("进来了3333...Java_com_decoder_ling_H264Decoder_init");
-        is_inited = true;
-        return 0;
+    if (video_stream_index == -1) {
+        return;
     }
-    return -3;
-    LOGE("出去了...Java_com_decoder_ling_H264Decoder_init");
-}
+    AVCodecContext *codec_ctx = avcodec_alloc_context3(NULL);
+    avcodec_parameters_to_context(codec_ctx, avStream->codecpar);
+    AVCodec *avCodec = avcodec_find_decoder(codec_ctx->codec_id);
+    if (avcodec_open2(codec_ctx, avCodec, NULL) < 0) {
+        return;
+    }
+    int y_size = codec_ctx->width * codec_ctx->height;
+    AVPacket *pkt = (AVPacket *) malloc(sizeof(AVPacket));
+    av_new_packet(pkt, y_size);
 
-extern "C"
-JNIEXPORT jboolean JNICALL
-Java_com_decoder_ling_H264Decoder_decode(JNIEnv *env, jobject thiz, jbyteArray data, jint num_bytes,
-                                         jlong packet_pts) {
-    LOGE("进来了...Java_com_decoder_ling_H264Decoder_decode");
+    /**
+    *初始化egl
+    **/
+    EGLConfig eglConf;
+    EGLSurface eglWindow;
+    EGLContext eglCtx;
+    int windowWidth;
+    int windowHeight;
+    ANativeWindow *nativeWindow = ANativeWindow_fromSurface(env, surface);
+
+    EGLint configSpec[] = { EGL_RED_SIZE, 8,
+                            EGL_GREEN_SIZE, 8,
+                            EGL_BLUE_SIZE, 8,
+                            EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_NONE };
+
+    EGLDisplay eglDisp = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    EGLint eglMajVers, eglMinVers;
+    EGLint numConfigs;
+    eglInitialize(eglDisp, &eglMajVers, &eglMinVers);
+    eglChooseConfig(eglDisp, configSpec, &eglConf, 1, &numConfigs);
+
+    eglWindow = eglCreateWindowSurface(eglDisp, eglConf,nativeWindow, NULL);
+
+    eglQuerySurface(eglDisp,eglWindow,EGL_WIDTH,&windowWidth);
+    eglQuerySurface(eglDisp,eglWindow,EGL_HEIGHT,&windowHeight);
+    const EGLint ctxAttr[] = {
+            EGL_CONTEXT_CLIENT_VERSION, 2,
+            EGL_NONE
+    };
+    eglCtx = eglCreateContext(eglDisp, eglConf,EGL_NO_CONTEXT, ctxAttr);
+
+    eglMakeCurrent(eglDisp, eglWindow, eglWindow, eglCtx);
+
+
+    /**
+     * 设置opengl 要在egl初始化后进行
+     * **/
+    float *vertexData = new float[12]{
+            1.0f, -1.0f, 0.0f,
+            -1.0f, -1.0f, 0.0f,
+            1.0f, 1.0f, 0.0f,
+            -1.0f, 1.0f, 0.0f
+    };
+
+    float *textureVertexData = new float[8]{
+            1.0f, 0.0f,//右下
+            0.0f, 0.0f,//左下
+            1.0f, 1.0f,//右上
+            0.0f, 1.0f//左上
+    };
+    ShaderUtils *shaderUtils = new ShaderUtils();
+
+    GLuint programId = shaderUtils->createProgram(vertexShaderString,fragmentShaderString );
+    delete shaderUtils;
+    GLuint aPositionHandle = (GLuint) glGetAttribLocation(programId, "aPosition");
+    GLuint aTextureCoordHandle = (GLuint) glGetAttribLocation(programId, "aTexCoord");
+
+    GLuint textureSamplerHandleY = (GLuint) glGetUniformLocation(programId, "yTexture");
+    GLuint textureSamplerHandleU = (GLuint) glGetUniformLocation(programId, "uTexture");
+    GLuint textureSamplerHandleV = (GLuint) glGetUniformLocation(programId, "vTexture");
+
+
+
+    //因为没有用矩阵所以就手动自适应
+    int videoWidth = codec_ctx->width;
+    int videoHeight = codec_ctx->height;
+
+    int left,top,viewWidth,viewHeight;
+    if(windowHeight > windowWidth){
+        left = 0;
+        viewWidth = windowWidth;
+        viewHeight = (int)(videoHeight*1.0f/videoWidth*viewWidth);
+        top = (windowHeight - viewHeight)/2;
+    }else{
+        top = 0;
+        viewHeight = windowHeight;
+        viewWidth = (int)(videoWidth*1.0f/videoHeight*viewHeight);
+        left = (windowWidth - viewWidth)/2;
+    }
+    glViewport(left, top, viewWidth, viewHeight);
+
+    glUseProgram(programId);
+    glEnableVertexAttribArray(aPositionHandle);
+    glVertexAttribPointer(aPositionHandle, 3, GL_FLOAT, GL_FALSE,12, vertexData);
+
+    glEnableVertexAttribArray(aTextureCoordHandle);
+    glVertexAttribPointer(aTextureCoordHandle,2,GL_FLOAT,GL_FALSE,8,textureVertexData);
+    /***
+     * 初始化空的yuv纹理
+     * **/
+    GLuint yTextureId;
+    GLuint uTextureId;
+    GLuint vTextureId;
+    glGenTextures(1,&yTextureId);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D,yTextureId);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,
+                    GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glUniform1i(textureSamplerHandleY,0);
+
+    glGenTextures(1,&uTextureId);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D,uTextureId);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,
+                    GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glUniform1i(textureSamplerHandleU,1);
+
+    glGenTextures(1,&vTextureId);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D,vTextureId);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,
+                    GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glUniform1i(textureSamplerHandleV,2);
+
+
+    /***
+     * 开始解码
+     * **/
     int ret;
-    jbyte *h264buff = env->GetByteArrayElements(data, 0);
-    AVPacket packet = {0};
-    packet.data = (uint8_t *)h264buff;
-    packet.size = env->GetArrayLength(data);
-    packet.pts = packet_pts;
-    // packet.stream_index = num_bytes;
-    ret = avcodec_send_packet(h264_codec_ctx, &packet);
-    return ret;
+    while (1) {
+        usleep(30000);
+        if (av_read_frame(fmt_ctx, pkt) < 0) {
+            //播放结束
+            break;
+        }
+        if (pkt->stream_index == video_stream_index) {
+            ret = avcodec_send_packet(codec_ctx, pkt);
+            if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
+                av_packet_unref(pkt);
+                continue;
+            }
+            AVFrame *yuvFrame = av_frame_alloc();
+            ret = avcodec_receive_frame(codec_ctx, yuvFrame);
+            if (ret < 0 && ret != AVERROR_EOF) {
+                av_frame_free(&yuvFrame);
+                av_packet_unref(pkt);
+                continue;
+            }
+            /***
+              * 解码后的数据更新到yuv纹理中
+            * **/
 
-}extern "C"
-JNIEXPORT void JNICALL
-Java_com_decoder_ling_H264Decoder_release(JNIEnv *env, jobject thiz) {
-    if (!is_inited) return;
-    avcodec_close(h264_codec_ctx);
-    is_inited = false;
-}extern "C"
-JNIEXPORT jboolean JNICALL
-Java_com_decoder_ling_H264Decoder_decodeBuffer(JNIEnv *env, jobject thiz, jobject data,
-                                               jint num_bytes, jlong packet_pts) {
-    // TODO: implement decodeBuffer()
-}extern "C"
-JNIEXPORT jint JNICALL
-Java_com_decoder_ling_H264Decoder_toTexture(JNIEnv *env, jobject thiz, jint texture_y,
-                                            jint texture_u, jint texture_v) {
-    AVFrame *yuv_frame = av_frame_alloc();
-    LOGE("进来了...Java_com_decoder_ling_H264Decoder_toTexture i = %d", avcodec_receive_frame(h264_codec_ctx, yuv_frame));
-    if (avcodec_receive_frame(h264_codec_ctx, yuv_frame) == 0) {
-        height = h264_codec_ctx->height;
-        width = h264_codec_ctx->width;
-        LOGE("进来了2222...Java_com_decoder_ling_H264Decoder_toTexture 0 = %d",yuv_frame->format);
-        LOGE("进来了2222...Java_com_decoder_ling_H264Decoder_toTexture 1 = %d",yuv_frame->linesize[1]);
-        LOGE("进来了2222...Java_com_decoder_ling_H264Decoder_toTexture 2 = %d",yuv_frame->linesize[2]);
+            LOGE("进来了2222...Java_com_decoder_ling_H264Decoder_toTexture 0 = %d",yuvFrame->format);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, yTextureId);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, yuvFrame->linesize[0], yuvFrame->height,0, GL_LUMINANCE, GL_UNSIGNED_BYTE, yuvFrame->data[0]);
 
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, texture_y);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, yuv_frame->linesize[0], yuv_frame->height,0, GL_LUMINANCE, GL_UNSIGNED_BYTE, yuv_frame->data[0]);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, uTextureId);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE,  yuvFrame->linesize[1], yuvFrame->height/2,0, GL_LUMINANCE, GL_UNSIGNED_BYTE, yuvFrame->data[1]);
 
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, texture_u);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE,  yuv_frame->linesize[1], yuv_frame->height/2,0, GL_LUMINANCE, GL_UNSIGNED_BYTE, yuv_frame->data[1]);
-
-        glActiveTexture(GL_TEXTURE2);
-        glBindTexture(GL_TEXTURE_2D, texture_v);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE,  yuv_frame->linesize[2], yuv_frame->height/2,0, GL_LUMINANCE, GL_UNSIGNED_BYTE, yuv_frame->data[2]);
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, vTextureId);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE,  yuvFrame->linesize[2], yuvFrame->height/2,0, GL_LUMINANCE, GL_UNSIGNED_BYTE, yuvFrame->data[2]);
 
 
-        /***
-        * 纹理更新完成后开始绘制
-        ***/
-        // glClear(GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT);
+            /***
+            * 纹理更新完成后开始绘制
+            ***/
+            glClear(GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT);
 
-        // glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
-        // eglSwapBuffers(eglDisp, eglWindow);
+            eglSwapBuffers(eglDisp, eglWindow);
 
-        av_frame_free(&yuv_frame);
-
-        return 1;
+            av_frame_free(&yuvFrame);
+        }
+        av_packet_unref(pkt);
     }
+    /***
+     * 释放资源
+     * **/
+    delete vertexData;
+    delete textureVertexData;
 
-    LOGE("出去了...Java_com_decoder_ling_H264Decoder_toTexture");
-    //av_frame_free(&yuv_frame);
-    return -1;
-}extern "C"
-JNIEXPORT jint JNICALL
-Java_com_decoder_ling_H264Decoder_toYUV(JNIEnv *env, jobject thiz, jbyteArray data) {
-    // TODO: implement toYUV()
-}extern "C"
-JNIEXPORT jint JNICALL
-Java_com_decoder_ling_H264Decoder_toBitmap(JNIEnv *env, jobject thiz, jobject bitmap) {
-    // TODO: implement toBitmap()
-}extern "C"
-JNIEXPORT jint JNICALL
-Java_com_decoder_ling_H264Decoder_getHeight(JNIEnv *env, jobject thiz) {
-    return height;
-}extern "C"
-JNIEXPORT jint JNICALL
-Java_com_decoder_ling_H264Decoder_getWidth(JNIEnv *env, jobject thiz) {
-    return width;
+    eglMakeCurrent(eglDisp, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroyContext(eglDisp, eglCtx);
+    eglDestroySurface(eglDisp, eglWindow);
+    eglTerminate(eglDisp);
+    eglDisp = EGL_NO_DISPLAY;
+    eglWindow = EGL_NO_SURFACE;
+    eglCtx = EGL_NO_CONTEXT;
+
+    avcodec_close(codec_ctx);
+    avformat_close_input(&fmt_ctx);
+
+    env->ReleaseStringUTFChars(path_, path);
 }
